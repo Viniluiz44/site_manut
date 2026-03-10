@@ -37,12 +37,23 @@ def _make_unique_cols(cols):
     return out
 
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove colunas 100% vazias (por índice, para não conflitar com nomes duplicados)
+    e depois renomeia garantindo unicidade dos nomes.
+    """
     df = df.copy()
-    # tira brancos totais antes de renomear
-    empty_cols = [c for c in df.columns if df[c].notna().sum() == 0]
-    if empty_cols:
-        df = df.drop(columns=empty_cols)
-    # renomeia com unicidade
+
+    # 1) Detecta colunas vazias por índice (evita ambiguidade com nomes duplicados)
+    empty_idx = []
+    for i in range(df.shape[1]):
+        col_series = df.iloc[:, i]
+        # se NENHUM valor não-nulo: é vazia
+        if not col_series.notna().any():
+            empty_idx.append(i)
+    if empty_idx:
+        df.drop(df.columns[empty_idx], axis=1, inplace=True)
+
+    # 2) Garante nomes únicos/limpos
     df.columns = _make_unique_cols(df.columns)
     return df
 
@@ -253,7 +264,6 @@ st.markdown('---')
 
 # Tabela detalhada
 st.subheader('Requisições filtradas')
-# .copy() só para garantir isolamento de view e evitar warnings
 st.dataframe(f.copy(), use_container_width=True, height=400)
 
 # Orç vs execução (BGT vs. REQ)
@@ -279,7 +289,6 @@ if budget_df is not None and not budget_df.empty:
         bgt_long['MÊS'] = bgt_long.apply(lambda r: f"{int(r['ANO'])}-{int(r['MES_NUM']):02d}", axis=1)
 
         # Vincular por Conta+Centro (quando existir)
-        # Nas requisições, usar colunas 'Conta' e 'Centro de Custo'
         req_aux = req_df.copy()
         req_aux.columns = [str(c).strip().upper() for c in req_aux.columns]
         if 'CONTA' in req_aux.columns and 'CENTRO DE CUSTO' in req_aux.columns:
