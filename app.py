@@ -12,13 +12,43 @@ pd.options.mode.copy_on_write = True
 st.set_page_config(page_title="Controle de Manutenção", layout="wide")
 
 # ===========================
-# Carregamento OTIMIZADO
+# Helpers de limpeza
 # ===========================
+
+def _make_unique_cols(cols):
+    """
+    - Normaliza nomes (remove \n, trim)
+    - Substitui vazios/Unnamed por BLANK_<idx>
+    - Garante unicidade com sufixo __1, __2, ...
+    """
+    out = []
+    seen = {}
+    for i, c in enumerate(cols):
+        name = "" if c is None else str(c)
+        name = name.replace("\n", " ").strip()
+        if name == "" or name.lower().startswith("unnamed"):
+            name = f"BLANK_{i+1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}__{seen[name]}"
+        else:
+            seen[name] = 0
+        out.append(name)
+    return out
 
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    # tira brancos totais antes de renomear
+    empty_cols = [c for c in df.columns if df[c].notna().sum() == 0]
+    if empty_cols:
+        df = df.drop(columns=empty_cols)
+    # renomeia com unicidade
+    df.columns = _make_unique_cols(df.columns)
     return df
+
+# ===========================
+# Carregamento OTIMIZADO
+# ===========================
 
 @st.cache_data(show_spinner=True)
 def load_requisicoes_smart(xlsx_path: str, sheet_hint: str = "requis") -> pd.DataFrame:
@@ -83,7 +113,6 @@ def load_requisicoes_smart(xlsx_path: str, sheet_hint: str = "requis") -> pd.Dat
     if "MÊS COMPETÊNCIA" in df.columns and pd.api.types.is_datetime64_any_dtype(df["MÊS COMPETÊNCIA"]):
         df["MÊS"] = df["MÊS COMPETÊNCIA"].dt.to_period("M").astype(str)
     else:
-        # fallback se o mês vier como texto
         if "MÊS COMPETÊNCIA" in df.columns:
             try:
                 _m = pd.to_datetime(df["MÊS COMPETÊNCIA"], errors="coerce")
@@ -224,7 +253,8 @@ st.markdown('---')
 
 # Tabela detalhada
 st.subheader('Requisições filtradas')
-st.dataframe(f, use_container_width=True, height=400)
+# .copy() só para garantir isolamento de view e evitar warnings
+st.dataframe(f.copy(), use_container_width=True, height=400)
 
 # Orç vs execução (BGT vs. REQ)
 if budget_df is not None and not budget_df.empty:
