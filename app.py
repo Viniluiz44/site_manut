@@ -18,7 +18,7 @@ def br_currency(x, pos=None):
         val = float(x)
     except Exception:
         val = 0.0
-    s = f"{abs(val):,.2f}"                       # 1,234,567.89
+    s = f"{abs(val):,.2f}"  # 1,234,567.89
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # 1.234.567,89
     if val < 0:
         return f"(R$ {s})"
@@ -76,10 +76,9 @@ def _to_number_br_series(s: pd.Series) -> pd.Series:
         if isinstance(x, (int, float, np.number)):
             return float(x)
         t = str(x).strip()
-        # Caso típico BR com vírgula decimal
+        # Caso típico BR com vírgula decimal (última vírgula depois do último ponto)
         if "," in t and (t.rfind(",") > t.rfind(".")):
             t = t.replace(".", "").replace(",", ".")
-        # Demais casos: tenta direto
         try:
             return float(t)
         except Exception:
@@ -389,22 +388,33 @@ if budget_df is not None and not budget_df.empty:
                 value_vars=present,
                 var_name='MES_NOME', value_name='BGT_VALOR'
             )
-            mapa_mes = {mes:i+1 for i, mes in enumerate(meses)}
+
+            # --- Garantias de tipo e colunas únicas ---
+            mapa_mes = {mes: i+1 for i, mes in enumerate(meses)}
             bgt_long['MES_NUM'] = bgt_long['MES_NOME'].map(mapa_mes)
 
-            if 'ANO' in budgetU.columns:
-                ano_guess = pd.to_numeric(bgt_long.get('ANO', pd.Series(np.nan)), errors='coerce')
-                bgt_long['ANO'] = ano_guess.fillna(datetime.now().year).astype(int)
+            # ANO: se existir no dataset, usa; senão, ano atual
+            if 'ANO' in bgt_long.columns:
+                bgt_long['ANO'] = pd.to_numeric(bgt_long['ANO'], errors='coerce').fillna(datetime.now().year).astype(int)
             else:
-                bgt_long['ANO'] = datetime.now().year
+                bgt_long['ANO'] = int(datetime.now().year)
 
-            bgt_long['MÊS'] = bgt_long.apply(lambda r: f"{int(r['ANO']):04d}-{int(r['MES_NUM']):02d}", axis=1)
+            # Remove QUALQUER coluna "MÊS" preexistente (evita duplicatas)
+            if (bgt_long.columns == 'MÊS').any():
+                bgt_long = bgt_long.loc[:, bgt_long.columns != 'MÊS']
+
+            # Cria MÊS de forma vetorizada (sem apply)
+            bgt_long['MES_NUM'] = pd.to_numeric(bgt_long['MES_NUM'], errors='coerce').fillna(1).astype(int).clip(1, 12)
+            ano_s = bgt_long['ANO'].astype(int).astype(str).str.zfill(4)
+            mes_s = bgt_long['MES_NUM'].astype(int).astype(str).str.zfill(2)
+            bgt_long['MÊS'] = ano_s + '-' + mes_s
 
             bgt_mes = (bgt_long.groupby('MÊS', as_index=False)['BGT_VALOR'].sum()
-                                .sort_values('MÊS'))
+                                  .sort_values('MÊS'))
         else:
             bgt_mes = pd.DataFrame(columns=['MÊS','BGT_VALOR'])
 
+        # ---- Alinha meses e plota (formatação contábil) ----
         comp = pd.merge(bgt_mes, req_mes, on='MÊS', how='outer').fillna(0.0).sort_values('MÊS')
 
         fig3, ax3 = plt.subplots(figsize=(8,3))
