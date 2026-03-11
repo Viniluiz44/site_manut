@@ -47,8 +47,7 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     empty_idx = []
     for i in range(df.shape[1]):
         col_series = df.iloc[:, i]
-        # se NENHUM valor não-nulo: é vazia
-        if not col_series.notna().any():
+        if not col_series.notna().any():  # nenhum não-nulo => vazia
             empty_idx.append(i)
     if empty_idx:
         df.drop(df.columns[empty_idx], axis=1, inplace=True)
@@ -56,6 +55,54 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     # 2) Garante nomes únicos/limpos
     df.columns = _make_unique_cols(df.columns)
     return df
+
+def _coerce_types_req(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pós-edição: força tipos nas requisições para manter cálculos e gráficos estáveis.
+    - VALOR -> numérico (aceita '1.234,56' e '1234.56')
+    - Datas relevantes -> datetime
+    - Recalcula 'MÊS' (YYYY-MM) a partir de 'MÊS COMPETÊNCIA' quando existir
+    """
+    d = df.copy()
+
+    if "VALOR" in d.columns:
+        # tenta lidar com vírgula decimal
+        d["VALOR"] = (
+            d["VALOR"]
+            .astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+        d["VALOR"] = pd.to_numeric(d["VALOR"], errors="coerce").fillna(0)
+
+    # Datas
+    for col in [
+        "MÊS COMPETÊNCIA","DATA DE CRIAÇÃO","Data Aprovação","DATA RECEBIMENTO",
+        "DATA DO DOC","DATA DE ENTRADA","DATA DE LANÇAMENTO"
+    ]:
+        if col in d.columns:
+            d[col] = pd.to_datetime(d[col], errors="coerce")
+
+    # Campo MÊS (YYYY-MM)
+    if "MÊS COMPETÊNCIA" in d.columns and pd.api.types.is_datetime64_any_dtype(d["MÊS COMPETÊNCIA"]):
+        d["MÊS"] = d["MÊS COMPETÊNCIA"].dt.to_period("M").astype(str)
+    else:
+        if "MÊS COMPETÊNCIA" in d.columns:
+            try:
+                _m = pd.to_datetime(d["MÊS COMPETÊNCIA"], errors="coerce")
+                d["MÊS"] = _m.dt.to_period("M").astype(str)
+            except Exception:
+                if "MÊS" not in d.columns:
+                    d["MÊS"] = pd.NaT
+        else:
+            if "MÊS" not in d.columns:
+                d["MÊS"] = pd.NaT
+
+    # Ajuste de 'CD ' -> 'CD'
+    if "CD" not in d.columns and "CD " in d.columns:
+        d["CD"] = d["CD "]
+
+    return d
 
 # ===========================
 # Carregamento OTIMIZADO
@@ -178,10 +225,8 @@ if req_df.empty:
     st.stop()
 
 # ===========================
-# Filtros / KPIs / Gráficos
+# Filtros
 # ===========================
-
-# Sidebar filtros
 st.sidebar.title('Filtros')
 
 cd_opts = sorted([x for x in req_df.get('CD', pd.Series(dtype=str)).dropna().astype(str).unique()])
@@ -202,7 +247,7 @@ subgrupo_sel = st.sidebar.multiselect('Subgrupo', subgrupo_opts, default=subgrup
 status_opts = sorted(req_df.get('STATUS', pd.Series(dtype=str)).dropna().astype(str).unique())
 status_sel = st.sidebar.multiselect('Status Requisição', status_opts, default=status_opts)
 
-# Aplicar filtros
+# Aplica filtros na base
 f = (
     req_df
     .assign(
@@ -213,7 +258,6 @@ f = (
         STATUS=lambda d: d.get('STATUS', pd.Series(dtype=str)).astype(str),
     )
 )
-
 if cd_sel:
     f = f[f['CD'].isin(cd_sel)]
 if ano_sel:
@@ -227,48 +271,69 @@ if subgrupo_sel:
 if status_sel:
     f = f[f['STATUS'].isin(status_sel)]
 
-# Top KPIs
+# ===========================
+# Tabela EDITÁVEL
+# ===========================
+st.subheader('Requisições filtradas (editável)')
+st.caption('As edições não sobrescrevem o arquivo Excel original. Você pode baixar as edições e, se quiser, atualizar a base depois.')
+
+edited_f = st.data_editor(
+    f,
+    num_rows="dynamic",                 # permite adicionar novas linhas
+    use_container_width=True,
+    height=420,
+    key="edit_req"
+)
+
+# Força tipos e campos calculados após edição
+f_used = _coerce_types_req(edited_f)
+
+# ===========================
+# KPIs (baseados na tabela editada)
+# ===========================
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.metric('Requisições (itens)', f.shape[0])
+    st.metric('Requisições (itens)', f_used.shape[0])
 with c2:
-    st.metric('Valor total (R$)', float(f['VALOR'].sum()))
+    st.metric('Valor total (R$)', float(f_used['VALOR'].sum()) if 'VALOR' in f_used.columns else 0.0)
 with c3:
-    st.metric('Ticket médio (R$)', float((f['VALOR'].sum() / f.shape[0]) if f.shape[0] else 0))
+    st.metric('Ticket médio (R$)', float((f_used['VALOR'].sum() / f_used.shape[0]) if ('VALOR' in f_used.columns and f_used.shape[0]) else 0))
 with c4:
-    aprovados = f[f.get('STATUS','')=='APROVADO']['VALOR'].sum() if 'STATUS' in f.columns else 0
+    aprovados = f_used[f_used.get('STATUS','')=='APROVADO']['VALOR'].sum() if 'STATUS' in f_used.columns and 'VALOR' in f_used.columns else 0
     st.metric('Aprovado (R$)', float(aprovados))
 
 st.markdown('---')
 
-# Gráficos
+# ===========================
+# Gráficos (com base em f_used)
+# ===========================
 g1, g2 = st.columns(2)
 with g1:
-    by_mes = f.groupby('MÊS', dropna=True)['VALOR'].sum().sort_index()
-    fig, ax = plt.subplots(figsize=(6,3))
-    by_mes.plot(kind='bar', ax=ax, color='#1f77b4')
-    ax.set_title('Despesas por mês (R$)')
-    ax.set_xlabel('Mês')
-    ax.set_ylabel('Valor (R$)')
-    st.pyplot(fig)
+    if 'MÊS' in f_used.columns and 'VALOR' in f_used.columns:
+        by_mes = f_used.groupby('MÊS', dropna=True)['VALOR'].sum().sort_index()
+        fig, ax = plt.subplots(figsize=(6,3))
+        by_mes.plot(kind='bar', ax=ax, color='#1f77b4')
+        ax.set_title('Despesas por mês (R$)')
+        ax.set_xlabel('Mês')
+        ax.set_ylabel('Valor (R$)')
+        st.pyplot(fig)
 with g2:
-    by_grupo = f.groupby('Grupo')['VALOR'].sum().sort_values(ascending=False).head(10)
-    fig2, ax2 = plt.subplots(figsize=(6,3))
-    by_grupo.plot(kind='barh', ax=ax2, color='#2ca02c')
-    ax2.set_title('Top 10 grupos por valor (R$)')
-    ax2.set_xlabel('Valor (R$)')
-    ax2.set_ylabel('Grupo')
-    st.pyplot(fig2)
+    if 'Grupo' in f_used.columns and 'VALOR' in f_used.columns:
+        by_grupo = f_used.groupby('Grupo')['VALOR'].sum().sort_values(ascending=False).head(10)
+        fig2, ax2 = plt.subplots(figsize=(6,3))
+        by_grupo.plot(kind='barh', ax=ax2, color='#2ca02c')
+        ax2.set_title('Top 10 grupos por valor (R$)')
+        ax2.set_xlabel('Valor (R$)')
+        ax2.set_ylabel('Grupo')
+        st.pyplot(fig2)
 
 st.markdown('---')
 
-# Tabela detalhada
-st.subheader('Requisições filtradas')
-st.dataframe(f.copy(), use_container_width=True, height=400)
-
-# Orç vs execução (BGT vs. REQ)
+# ===========================
+# BGT x REQ (AGORA usa a tabela filtrada + editada)
+# ===========================
 if budget_df is not None and not budget_df.empty:
-    st.subheader('Orçado x Requisitado')
+    st.subheader('Orçado x Requisitado (a partir da tabela acima)')
 
     # Transform budget (mensal) para formato longo
     budget = budget_df.copy()
@@ -276,7 +341,7 @@ if budget_df is not None and not budget_df.empty:
     meses = ['JANEIRO','FEVEREIRO','MARÇO','ABRIL','MAIO','JUNHO','JULHO','AGOSTO','SETEMBRO','OUTUBRO','NOVEMBRO','DEZEMBRO']
     present = [m for m in meses if m in budget.columns]
 
-    if present:
+    if present and not f_used.empty:
         bgt_long = budget.melt(
             id_vars=[c for c in budget.columns if c not in present],
             value_vars=present,
@@ -288,9 +353,10 @@ if budget_df is not None and not budget_df.empty:
         bgt_long['ANO'] = datetime.now().year
         bgt_long['MÊS'] = bgt_long.apply(lambda r: f"{int(r['ANO'])}-{int(r['MES_NUM']):02d}", axis=1)
 
-        # Vincular por Conta+Centro (quando existir)
-        req_aux = req_df.copy()
+        # Vincular por Conta+Centro (quando existir) usando a TABELA EDITADA
+        req_aux = f_used.copy()
         req_aux.columns = [str(c).strip().upper() for c in req_aux.columns]
+
         if 'CONTA' in req_aux.columns and 'CENTRO DE CUSTO' in req_aux.columns:
             req_aux['CHAVE'] = req_aux['CONTA'].astype(str)+'_'+req_aux['CENTRO DE CUSTO'].astype(str)
         elif 'CÓD. (CONTA+CENTRO)' in req_aux.columns:
@@ -306,10 +372,16 @@ if budget_df is not None and not budget_df.empty:
         else:
             bgt_aux['CHAVE'] = None
 
+        # Mês nas requisições (garantia)
+        if 'MÊS COMPETÊNCIA' in req_aux.columns and 'MÊS' not in req_aux.columns:
+            req_aux['MÊS'] = pd.to_datetime(req_aux['MÊS COMPETÊNCIA'], errors='coerce').dt.to_period('M').astype(str)
+
         exec_mes = (
             req_aux
-            .assign(MÊS=lambda d: pd.to_datetime(d.get('MÊS COMPETÊNCIA'), errors='coerce').dt.to_period('M').astype(str))
-            .groupby(['CHAVE','MÊS'], dropna=False)['VALOR'].sum().reset_index(name='REQ_VALOR')
+            .groupby(['CHAVE','MÊS'], dropna=False)['VALOR'].sum()
+            .reset_index(name='REQ_VALOR')
+            if 'VALOR' in req_aux.columns and 'MÊS' in req_aux.columns
+            else pd.DataFrame(columns=['CHAVE','MÊS','REQ_VALOR'])
         )
 
         comp = (
@@ -332,12 +404,16 @@ if budget_df is not None and not budget_df.empty:
         comp['Disponível'] = comp['BGT_VALOR'] - comp['REQ_VALOR']
         st.dataframe(comp, use_container_width=True)
 
+# ===========================
 # Estornos Abertos
+# ===========================
 if estorno_df is not None and not estorno_df.empty:
     st.subheader('Estornos Abertos')
     st.dataframe(estorno_df, use_container_width=True, height=300)
 
-# Download dos dados filtrados
+# ===========================
+# Download (usando a base editada)
+# ===========================
 st.markdown('---')
 
 def to_excel_bytes(df_dict):
@@ -348,14 +424,14 @@ def to_excel_bytes(df_dict):
     output.seek(0)
     return output
 
-colA, colB = st.columns(2)
+colA, colB, colC = st.columns(3)
 with colA:
-    if st.button('Baixar Requisições Filtradas (Excel)'):
-        bio = to_excel_bytes({'Requisicoes': f})
+    if st.button('Baixar Requisições (filtradas e editadas)'):
+        bio = to_excel_bytes({'Requisicoes_EditarPainel': f_used})
         st.download_button(
-            'Download Requisicoes.xlsx',
+            'Download Requisicoes_Editadas.xlsx',
             data=bio,
-            file_name='Requisicoes_filtrado.xlsx',
+            file_name='Requisicoes_editadas.xlsx',
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
 with colB:
@@ -368,5 +444,7 @@ with colB:
                 file_name='Budget.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
+with colC:
+    st.caption('Use este botão para baixar suas edições e, se desejar, atualizar o Excel original depois.')
 
 st.caption('© 2026 - Painel criado para apoiar controle de requisições, NF e budget de Manutenção.')
