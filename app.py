@@ -337,6 +337,7 @@ with g2:
 st.markdown('---')
 
 # ======= BGT x REQ (a partir da tabela filtrada + editada) =======
+# ======= BGT x REQ (a partir da tabela filtrada + editada) =======
 if budget_df is not None and not budget_df.empty:
     st.subheader('Orçado x Requisitado (a partir da tabela acima)')
 
@@ -351,7 +352,6 @@ if budget_df is not None and not budget_df.empty:
                   .groupby('MÊS', dropna=False)['VALOR']
                   .sum()
                   .reset_index(name='REQ_VALOR')
-                  .sort_values('MÊS')
         )
 
         # --- BGT por mês, filtrado conforme dimensões presentes na tabela ---
@@ -360,6 +360,14 @@ if budget_df is not None and not budget_df.empty:
         reqU = f_used.copy()
         reqU.columns = [str(c).strip().upper() for c in reqU.columns]
 
+        # 1) Força NÚMERICO nas colunas de meses do Budget
+        meses = ['JANEIRO','FEVEREIRO','MARÇO','ABRIL','MAIO','JUNHO',
+                 'JULHO','AGOSTO','SETEMBRO','OUTUBRO','NOVEMBRO','DEZEMBRO']
+        for m in meses:
+            if m in budgetU.columns:
+                budgetU[m] = _to_number_br_series(budgetU[m]).fillna(0.0)
+
+        # 2) Filtro resiliente por dimensões (se zerar o conjunto, ignora o filtro)
         dim_pairs = [
             ('CD', 'CD'),
             ('GRUPO', 'GRUPO'),
@@ -368,55 +376,83 @@ if budget_df is not None and not budget_df.empty:
             ('CENTRO DE CUSTO', 'CENTRO DE CUSTO'),
             ('CÓD.', 'CÓD. (CONTA+CENTRO)'),
         ]
-
         mask = pd.Series(True, index=budgetU.index)
         for bgt_col, req_col in dim_pairs:
             if bgt_col in budgetU.columns and req_col in reqU.columns:
                 values = reqU[req_col].dropna().astype(str).unique()
                 if len(values) > 0:
-                    mask &= budgetU[bgt_col].astype(str).isin(values)
-
+                    cand = mask & budgetU[bgt_col].astype(str).isin(values)
+                    # só aplica se não “zera” tudo
+                    if cand.any():
+                        mask = cand
         budgetU = budgetU[mask]
 
-        meses = ['JANEIRO','FEVEREIRO','MARÇO','ABRIL','MAIO','JUNHO',
-                 'JULHO','AGOSTO','SETEMBRO','OUTUBRO','NOVEMBRO','DEZEMBRO']
+        # 3) Derrete meses e cria coluna 'MÊS' (vetorizado, sem apply)
         present = [m for m in meses if m in budgetU.columns]
-
-        if present:
+        if present and not budgetU.empty:
             bgt_long = budgetU.melt(
                 id_vars=[c for c in budgetU.columns if c not in present],
                 value_vars=present,
                 var_name='MES_NOME', value_name='BGT_VALOR'
             )
+            bgt_long['BGT_VALOR'] = _to_number_br_series(bgt_long['BGT_VALOR']).fillna(0.0)
 
-            # --- Garantias de tipo e colunas únicas ---
             mapa_mes = {mes: i+1 for i, mes in enumerate(meses)}
             bgt_long['MES_NUM'] = bgt_long['MES_NOME'].map(mapa_mes)
 
-            # ANO: se existir no dataset, usa; senão, ano atual
+            # ANO: tenta usar do Budget; se não houver, derive do filtro de Ano ou do ano atual
             if 'ANO' in bgt_long.columns:
-                bgt_long['ANO'] = pd.to_numeric(bgt_long['ANO'], errors='coerce').fillna(datetime.now().year).astype(int)
+                bgt_long['ANO'] = pd.to_numeric(bgt_long['ANO'], errors='coerce')
             else:
-                bgt_long['ANO'] = int(datetime.now().year)
+                bgt_long['ANO'] = pd.Series(np.nan, index=bgt_long.index)
+
+            # Escopo de anos: 1) filtro "Ano", 2) anos de f_used/MÊS, 3) ano atual
+            anos_scope = []
+            if 'ano_sel' in locals() and ano_sel:
+                anos_scope = sorted(set(int(a) for a in ano_sel))
+            if not anos_scope and 'MÊS' in req_mes.columns and not req_mes.empty:
+                anos_from_req = pd.to_numeric(req_mes['MÊS'].str.slice(0, 4), errors='coerce').dropna().astype(int).unique()
+                anos_scope = sorted(set(anos_from_req.tolist()))
+            if not anos_scope:
+                anos_scope = [datetime.now().year]
+
+            bgt_long.loc[bgt_long['ANO'].isna(), 'ANO'] = anos_scope[0]
+            bgt_long['ANO'] = bgt_long['ANO'].astype(int)
 
             # Remove QUALQUER coluna "MÊS" preexistente (evita duplicatas)
             if (bgt_long.columns == 'MÊS').any():
                 bgt_long = bgt_long.loc[:, bgt_long.columns != 'MÊS']
 
-            # Cria MÊS de forma vetorizada (sem apply)
             bgt_long['MES_NUM'] = pd.to_numeric(bgt_long['MES_NUM'], errors='coerce').fillna(1).astype(int).clip(1, 12)
             ano_s = bgt_long['ANO'].astype(int).astype(str).str.zfill(4)
             mes_s = bgt_long['MES_NUM'].astype(int).astype(str).str.zfill(2)
             bgt_long['MÊS'] = ano_s + '-' + mes_s
 
-            bgt_mes = (bgt_long.groupby('MÊS', as_index=False)['BGT_VALOR'].sum()
-                                  .sort_values('MÊS'))
+            bgt_mes = (bgt_long.groupby('MÊS', as_index=False)['BGT_VALOR'].sum())
         else:
             bgt_mes = pd.DataFrame(columns=['MÊS','BGT_VALOR'])
 
-        # ---- Alinha meses e plota (formatação contábil) ----
-        comp = pd.merge(bgt_mes, req_mes, on='MÊS', how='outer').fillna(0.0).sort_values('MÊS')
+        # 4) Calendário completo 01..12 para os ANOS em escopo
+        if 'ano_sel' in locals() and ano_sel:
+            anos_scope = sorted(set(int(a) for a in ano_sel))
+        else:
+            # tenta anos do REQ; senão do BGT; senão ano atual
+            anos_req = pd.to_numeric(req_mes['MÊS'].str.slice(0, 4), errors='coerce').dropna().astype(int).unique() if not req_mes.empty else []
+            anos_bgt = pd.to_numeric(bgt_mes['MÊS'].str.slice(0, 4), errors='coerce').dropna().astype(int).unique() if not bgt_mes.empty else []
+            anos_scope = sorted(set(list(anos_req) + list(anos_bgt))) or [datetime.now().year]
 
+        cal = pd.DataFrame({
+            'MÊS': [f"{a:04d}-{m:02d}" for a in anos_scope for m in range(1, 13)]
+        })
+
+        # 5) Junta calendário + BGT + REQ, preenche vazios com 0
+        comp = (cal
+                .merge(bgt_mes, on='MÊS', how='left')
+                .merge(req_mes, on='MÊS', how='left')
+                .fillna(0.0)
+                .sort_values('MÊS'))
+
+        # 6) Gráfico com formatação contábil
         fig3, ax3 = plt.subplots(figsize=(8,3))
         ax3.plot(comp['MÊS'], comp['BGT_VALOR'], marker='o', label='Orçado (BGT)')
         ax3.plot(comp['MÊS'], comp['REQ_VALOR'], marker='o', label='Requisitado (REQ)')
